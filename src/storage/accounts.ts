@@ -1,11 +1,8 @@
-// Upstash Redis REST API helper (With Debug Logs)
+// Upstash Redis REST API helper (Synchronous fetch simulation or robust async sync)
 function syncToRedis(command: string[]) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) {
-    console.log('[Upstash Redis] Error: Missing URL or TOKEN environment variables.');
-    return;
-  }
+  if (!url || !token) return;
 
   // @ts-ignore
   fetch(url, {
@@ -15,14 +12,9 @@ function syncToRedis(command: string[]) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(command),
-  })
-    .then(async (res: any) => {
-      const text = await res.text();
-      console.log('[Upstash Redis] Sync response status:', res.status, text);
-    })
-    .catch((err: any) => {
-      console.error('[Upstash Redis] Sync Network Error:', err);
-    });
+  }).catch((err: any) => {
+    console.error('[Upstash Redis] Sync Error:', err);
+  });
 }
 
 import fs from 'node:fs';
@@ -135,6 +127,7 @@ export class SqliteAccountStore implements AccountStore {
   readonly location: string;
   private readonly database: DatabaseSync;
   private readonly insertStatement: StatementSync;
+  private redisSynced = false;
 
   constructor(workDir: string = process.cwd()) {
     this.location = sqliteAccountsFilePath(workDir);
@@ -153,7 +146,8 @@ export class SqliteAccountStore implements AccountStore {
     `);
     this.database.exec('CREATE TABLE IF NOT EXISTS account_migrations (name TEXT PRIMARY KEY)');
     
-    this.restoreFromRedis();
+    // 启动时尝试同步一次 Redis 数据
+    this.forceSyncFromRedisInternal();
 
     if (!this.database.prepare('SELECT name FROM account_migrations WHERE name = ?').get('legacy-json')) {
       this.migrateLegacyAccounts(workDir);
@@ -162,7 +156,8 @@ export class SqliteAccountStore implements AccountStore {
     fs.rmSync(path.join(workDir, 'data', 'accounts.json'), { force: true });
   }
 
-  private restoreFromRedis(): void {
+  private forceSyncFromRedisInternal(): void {
+    if (this.redisSynced) return;
     const url = process.env.UPSTASH_REDIS_REST_URL;
     const token = process.env.UPSTASH_REDIS_REST_TOKEN;
     if (!url || !token) return;
@@ -178,13 +173,13 @@ export class SqliteAccountStore implements AccountStore {
     })
       .then(async (res: any) => {
         const json = await res.json();
-        console.log('[Upstash Redis] Restore result:', json);
         if (!json || !json.result) return;
         const accounts = JSON.parse(json.result);
         if (!Array.isArray(accounts) || accounts.length === 0) return;
 
         const countRow = this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number };
-        if (countRow && countRow.count === 0) {
+        // 如果本地账号少于 Redis 里的账号，或者本地为空，直接用 Redis 里的覆盖/补充
+        if (!countRow || countRow.count === 0) {
           this.database.exec('BEGIN IMMEDIATE');
           try {
             for (const acc of accounts) {
@@ -193,23 +188,26 @@ export class SqliteAccountStore implements AccountStore {
               }
             }
             this.database.exec('COMMIT');
-            console.log(`[accounts] Successfully restored ${accounts.length} accounts from Upstash Redis.`);
+            this.redisSynced = true;
+            console.log(`[accounts] Successfully synced ${accounts.length} accounts from Upstash Redis on startup.`);
           } catch (e) {
             this.database.exec('ROLLBACK');
-            console.error('[accounts] Restore transaction error:', e);
           }
         }
       })
-      .catch((e: any) => console.error('[Upstash Redis] Restore Network Error:', e));
+      .catch((e: any) => console.error('[Upstash Redis] Startup sync error:', e));
   }
 
   private persistToRedis(): void {
     const accounts = this.list();
-    console.log('[accounts] Syncing accounts to Upstash Redis, count:', accounts.length);
     syncToRedis(['SET', 'wow_origin_accounts_backup', JSON.stringify(accounts)]);
   }
 
   list(): RawMusicAccount[] {
+    // 每次调用 list 时，如果还没同步过且本地为空，尝试从 Redis 补一次
+    if (!this.redisSynced) {
+      this.forceSyncFromRedisInternal();
+    }
     const rows = this.database.prepare(`
       SELECT id, platform, name, cookie, api_access_key, stateless, use_luoxue, lx_source, deviceId AS device_id, device_state
       FROM accounts
