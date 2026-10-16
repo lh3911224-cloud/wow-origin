@@ -151,7 +151,7 @@ export class SqliteAccountStore implements AccountStore {
         updated_at=CURRENT_TIMESTAMP
     `);
 
-    // 启动时优先尝试从 Upstash Redis 恢复数据到本地 SQLite
+    // 启动时优先从 Upstash Redis 恢复数据，并覆盖本地 SQLite 旧数据
     this.restoreFromRedisBlocking();
     fs.rmSync(path.join(workDir, 'data', 'accounts.json'), { force: true });
   }
@@ -161,19 +161,12 @@ export class SqliteAccountStore implements AccountStore {
     if (!url || !token) return;
 
     try {
-      // 检查本地是不是已经有账号了
-      const countRow = this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number };
-      if (countRow && countRow.count > 0) return; // 如果本地有，直接用本地的
-
-      // 如果本地为空，尝试同步拉取 Redis 备份
-      // 使用全局同步机制保证冷启动瞬间能读到
       const cached = (globalThis as any)._redisAccountsCache;
       if (Array.isArray(cached) && cached.length > 0) {
         this.writeBatch(cached);
         return;
       }
 
-      // 发起请求同步
       // @ts-ignore
       fetch(url, {
         method: 'POST',
@@ -188,14 +181,20 @@ export class SqliteAccountStore implements AccountStore {
           if (json && json.result) {
             const parsed = JSON.parse(json.result);
             if (Array.isArray(parsed) && parsed.length > 0) {
+              // 先清空本地旧账号，再写入 Redis 最新备份
+              this.database.exec('DELETE FROM accounts;');
               (globalThis as any)._redisAccountsCache = parsed;
               this.writeBatch(parsed);
-              console.log(`[SqliteStore] Restored ${parsed.length} accounts from Redis.`);
+              console.log(`[SqliteStore] Restored ${parsed.length} accounts from Redis, overwrite local db.`);
             }
           }
         })
-        .catch(() => {});
-    } catch (e) {}
+        .catch((err) => {
+          console.log('[SqliteStore] Redis restore failed', err);
+        });
+    } catch (e) {
+      console.log('[SqliteStore] restoreFromRedisBlocking error', e);
+    }
   }
 
   private writeBatch(accounts: RawMusicAccount[]): void {
