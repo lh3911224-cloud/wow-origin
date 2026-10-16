@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { RawMusicAccount } from '../accounts';
+import { Redis } from "@upstash/redis";
 
 export interface AccountStore {
   readonly location: string;
@@ -151,49 +152,25 @@ export class SqliteAccountStore implements AccountStore {
         updated_at=CURRENT_TIMESTAMP
     `);
 
-    // 启动时优先从 Upstash Redis 恢复数据，并覆盖本地 SQLite 旧数据
-    this.restoreFromRedisBlocking();
     fs.rmSync(path.join(workDir, 'data', 'accounts.json'), { force: true });
   }
 
-  private restoreFromRedisBlocking(): void {
+  // 异步初始化，等待Redis读取完成
+  async init(): Promise<void> {
     const { url, token } = getRedisConfig();
     if (!url || !token) return;
-
+    const redis = new Redis({ url, token });
     try {
-      const cached = (globalThis as any)._redisAccountsCache;
-      if (Array.isArray(cached) && cached.length > 0) {
-        this.writeBatch(cached);
-        return;
+      const raw = await redis.get<string>(REDIS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        this.database.exec('DELETE FROM accounts;');
+        this.writeBatch(parsed);
+        console.log(`[SqliteStore] Restored ${parsed.length} accounts from Redis, overwrite local db.`);
       }
-
-      // @ts-ignore
-      fetch(url, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(['GET', REDIS_KEY]),
-      })
-        .then(async (res: any) => {
-          const json = await res.json();
-          if (json && json.result) {
-            const parsed = JSON.parse(json.result);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              // 先清空本地旧账号，再写入 Redis 最新备份
-              this.database.exec('DELETE FROM accounts;');
-              (globalThis as any)._redisAccountsCache = parsed;
-              this.writeBatch(parsed);
-              console.log(`[SqliteStore] Restored ${parsed.length} accounts from Redis, overwrite local db.`);
-            }
-          }
-        })
-        .catch((err) => {
-          console.log('[SqliteStore] Redis restore failed', err);
-        });
-    } catch (e) {
-      console.log('[SqliteStore] restoreFromRedisBlocking error', e);
+    } catch (err) {
+      console.log('[SqliteStore] Redis restore failed', err);
     }
   }
 
@@ -213,7 +190,6 @@ export class SqliteAccountStore implements AccountStore {
 
   private persist(): void {
     const accounts = this.list();
-    (globalThis as any)._redisAccountsCache = accounts;
     syncToRedis(accounts);
   }
 
@@ -264,6 +240,8 @@ export class SqliteAccountStore implements AccountStore {
   }
 }
 
-export function createLocalAccountStore(workDir: string = process.cwd()): SqliteAccountStore {
-  return new SqliteAccountStore(workDir);
+export async function createLocalAccountStore(workDir: string = process.cwd()) {
+  const store = new SqliteAccountStore(workDir);
+  await store.init(); // 这里等待Redis加载完毕
+  return store;
 }
