@@ -1,24 +1,19 @@
 // Upstash Redis REST API helper
-async function upstashRedisCmd(command: string[]) {
+function syncToRedis(command: string[]) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return null;
+  if (!url || !token) return;
 
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(command),
-    });
-    const data = await res.json();
-    return data.result;
-  } catch (err) {
+  fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(command),
+  }).catch((err) => {
     console.error('Upstash Redis Sync Error:', err);
-    return null;
-  }
+  });
 }
 
 import fs from 'node:fs';
@@ -149,8 +144,8 @@ export class SqliteAccountStore implements AccountStore {
     `);
     this.database.exec('CREATE TABLE IF NOT EXISTS account_migrations (name TEXT PRIMARY KEY)');
     
-    // 同步云端 Redis 数据到本地 SQLite
-    this.syncFromRedis();
+    // 初始化时，如果 Redis 有备份数据且本地为空，则插入本地
+    this.restoreFromRedis();
 
     if (!this.database.prepare('SELECT name FROM account_migrations WHERE name = ?').get('legacy-json')) {
       this.migrateLegacyAccounts(workDir);
@@ -159,49 +154,47 @@ export class SqliteAccountStore implements AccountStore {
     fs.rmSync(path.join(workDir, 'data', 'accounts.json'), { force: true });
   }
 
-  // 从 Upstash Redis 恢复数据到本地
-  private syncFromRedis(): void {
-    try {
-      // 异步转同步获取（在构造函数中通过 IIFE 执行）
-      upstashRedisCmd(['GET', 'wow_origin_accounts_backup']).then((remoteData) => {
-        if (!remoteData) return;
-        const accounts = JSON.parse(remoteData);
+  private restoreFromRedis(): void {
+    const url = process.env.UPSTASH_REDIS_REST_URL;
+    const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+    if (!url || !token) return;
+
+    fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(['GET', 'wow_origin_accounts_backup']),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (!data || !data.result) return;
+        const accounts = JSON.parse(data.result);
         if (!Array.isArray(accounts) || accounts.length === 0) return;
 
-        const count = Number((this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number }).count);
-        if (count === 0) {
+        const countRow = this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number };
+        if (countRow && countRow.count === 0) {
           this.database.exec('BEGIN IMMEDIATE');
           try {
-            accounts.forEach((acc) => {
+            for (const acc of accounts) {
               if (acc && typeof acc === 'object') {
                 this.insertStatement.run(...accountValues(acc as RawMusicAccount));
               }
-            });
+            }
             this.database.exec('COMMIT');
-            console.log(`[accounts] Successfully restored ${accounts.length} accounts from Upstash Redis.`);
+            console.log(`[accounts] Restored ${accounts.length} accounts from Upstash Redis.`);
           } catch (e) {
             this.database.exec('ROLLBACK');
-            console.error('[accounts] Failed to restore from Redis:', e);
           }
         }
-      }).catch(err => {
-        console.error('[accounts] Redis fetch failed during init:', err);
-      });
-    } catch (e) {
-      console.error('[accounts] syncFromRedis error:', e);
-    }
+      })
+      .catch((e) => console.error('[accounts] Redis restore error:', e));
   }
 
-  // 每次修改后同步备份到 Upstash Redis
   private persistToRedis(): void {
-    try {
-      const accounts = this.list();
-      upstashRedisCmd(['SET', 'wow_origin_accounts_backup', JSON.stringify(accounts)]).catch(err => {
-        console.error('[accounts] Failed to backup to Redis:', err);
-      });
-    } catch (e) {
-      console.error('[accounts] persistToRedis error:', e);
-    }
+    const accounts = this.list();
+    syncToRedis(['SET', 'wow_origin_accounts_backup', JSON.stringify(accounts)]);
   }
 
   list(): RawMusicAccount[] {
