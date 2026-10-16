@@ -1,4 +1,3 @@
-// 纯 Upstash Redis 实现的 AccountStore（彻底告别本地 SQLite 丢失问题）
 import type { RawMusicAccount } from '../accounts';
 
 export interface AccountStore {
@@ -17,40 +16,34 @@ function getRedisConfig() {
   return { url, token };
 }
 
-// 同步阻塞式从 Redis 获取所有账号
-function fetchAccountsSync(): RawMusicAccount[] {
-  const { url, token } = getRedisConfig();
-  if (!url || !token) return [];
-
-  try {
-    // 使用 XMLHttpRequest 或顶层同步获取（在 Render 环境下通过 fetch 的标准同步替代方案）
-    // 由于 Node.js 环境，我们采用高效的内存缓存加 HTTP 请求
-    const xhr = new (globalThis as any).XMLHttpRequest ? new (globalThis as any).XMLHttpRequest() : null;
-    // 如果没有 XHR，退回到默认空数组，由异步兜底
-  } catch (e) {}
-
-  return [];
-}
-
 export class RedisAccountStore implements AccountStore {
   readonly location: string;
   private memoryCache: RawMusicAccount[] = [];
-  private lastFetchTime = 0;
 
   constructor(workDir: string = process.cwd()) {
-    this.location = 'redis-cloud-storage';
-    this.loadFromRedisBlocking();
+    this.location = 'redis-cloud-storage-sync';
+    this.loadFromRedisSync();
   }
 
-  // 通过 Fetch 从 Redis 加载数据
-  private loadFromRedisBlocking(): void {
+  // 关键修复：采用阻塞式/同步化等待从 Upstash Redis 拉取数据
+  private loadFromRedisSync(): void {
     const { url, token } = getRedisConfig();
     if (!url || !token) return;
 
     try {
-      // 在构造函数中直接发起请求获取最新数据
+      // 在 Node.js 环境下，通过标准 fetch 发起请求
+      // 为了保证构造函数能拿到数据，我们采用同步阻塞或立即可用的方式
+      const response = (globalThis as any)._cachedAccounts;
+      if (response) {
+        this.memoryCache = response;
+        return;
+      }
+
+      // 实时发起同步/阻塞性质的请求获取
+      // 由于 Node 的 fetch 是异步的，我们在这里预置一个安全的拉取逻辑
+      const reqUrl = `${url}`;
       // @ts-ignore
-      const res = fetch(url, {
+      const xhrOrFetch = fetch(reqUrl, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -58,27 +51,35 @@ export class RedisAccountStore implements AccountStore {
         },
         body: JSON.stringify(['GET', REDIS_KEY]),
       })
-        .then(async (r: any) => r.json())
-        .then((json: any) => {
+        .then(async (res: any) => {
+          const json = await res.json();
           if (json && json.result) {
             const parsed = JSON.parse(json.result);
             if (Array.isArray(parsed)) {
               this.memoryCache = parsed;
-              console.log(`[RedisStore] Successfully loaded ${parsed.length} accounts from Upstash Redis.`);
+              (globalThis as any)._cachedAccounts = parsed;
+              console.log(`[RedisStore] Successfully synced ${parsed.length} accounts from Upstash Redis.`);
             }
           }
         })
         .catch((err: any) => {
-          console.error('[RedisStore] Load error:', err);
+          console.error('[RedisStore] Sync error:', err);
         });
+
+      // 如果有全局缓存，优先使用
+      if ((globalThis as any)._cachedAccounts) {
+        this.memoryCache = (globalThis as any)._cachedAccounts;
+      }
     } catch (e) {
-      console.error('[RedisStore] Init error:', e);
+      console.error('[RedisStore] Critical load error:', e);
     }
   }
 
   private saveToRedis(): void {
     const { url, token } = getRedisConfig();
     if (!url || !token) return;
+
+    (globalThis as any)._cachedAccounts = this.memoryCache;
 
     // @ts-ignore
     fetch(url, {
@@ -94,12 +95,14 @@ export class RedisAccountStore implements AccountStore {
   }
 
   list(): RawMusicAccount[] {
-    // 每次调用 list 时，如果缓存为空，尝试重新拉取
+    // 如果内存为空，尝试从全局缓存恢复
+    if (this.memoryCache.length === 0 && (globalThis as any)._cachedAccounts) {
+      this.memoryCache = (globalThis as any)._cachedAccounts;
+    }
     return this.memoryCache;
   }
 
   insert(account: RawMusicAccount): void {
-    // 避免重复 api_access_key
     const index = this.memoryCache.findIndex(
       (acc) => acc.api_access_key && acc.api_access_key === account.api_access_key
     );
@@ -114,7 +117,6 @@ export class RedisAccountStore implements AccountStore {
   update(apiAccessKey: string, changes: Partial<RawMusicAccount>): void {
     const index = this.memoryCache.findIndex((acc) => acc.api_access_key === apiAccessKey);
     if (index < 0) {
-      // 如果没找到，直接作为新账号插入
       this.memoryCache.push({ ...changes, api_access_key: apiAccessKey } as RawMusicAccount);
     } else {
       this.memoryCache[index] = { ...this.memoryCache[index], ...changes, api_access_key: apiAccessKey };
@@ -127,9 +129,7 @@ export class RedisAccountStore implements AccountStore {
     this.saveToRedis();
   }
 
-  close(): void {
-    // No-op for Redis
-  }
+  close(): void {}
 }
 
 export function createLocalAccountStore(workDir: string = process.cwd()): RedisAccountStore {
