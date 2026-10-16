@@ -8,6 +8,7 @@ import { preloadData } from './onload';
 import { APIError } from './errors';
 import { AccountSessionRegistry, extractAuthorizationToken, loadAccountSessions } from './accounts';
 import type { AccountStore } from './storage';
+import type { SqliteAccountStore } from './storage/accounts';
 import { createLoginRouter } from './login';
 import { createDashboardRouter } from './dashboard';
 import { createLoginRefreshScheduler, ensureQQLoginFresh, clearAccountLoginRefresh } from './loginRefresh';
@@ -43,7 +44,8 @@ class MultiPlatformServer {
   constructor(options: CreateAppOptions = {}) {
     this.adminManagementPassword = options.adminManagementPassword ?? process.env.ADMIN_MANAGEMENT_PASSWORD ?? '';
     this.logger = new Logger({ component: 'server' });
-    this.accountStore = options.accountStore ?? loadLocalAccountStore();
+    // this.accountStore = options.accountStore ?? loadLocalAccountStore();
+    this.accountStore = options.accountStore!;
     this.lxSourceManager = options.lxSourceManager ?? loadLocalLxSourceManager();
     this.cloudflare = options.cloudflare === true;
     this.serveStatic = options.serveStatic ?? !this.cloudflare;
@@ -58,7 +60,10 @@ class MultiPlatformServer {
     if (this.initialized) {
       return this.app!;
     }
-
+    if (!this.accountStore) {
+      this.accountStore = loadLocalAccountStore();
+      await (this.accountStore as SqliteAccountStore).init();
+    }
     await this.registerPlatforms();
 
     this.app = express();
@@ -87,8 +92,8 @@ class MultiPlatformServer {
 
       await platformFactory.initialize();
 
-      const platformCount: number = platformFactory.getAvailablePlatforms().length;
-      this.logger.compact('platform', `Platform registration completed (${platformCount} platforms loaded)`, 'debug');
+      const platformCount = platformFactory.getAvailablePlatforms().length;
+      this.logger.compact('platform', `${platformCount} platforms registered`, 'debug');
 
       return true;
     } catch (error) {
@@ -157,7 +162,7 @@ class MultiPlatformServer {
     this.app!.use('/v1', async (req: Request, _res: Response, next: NextFunction) => {
       const key = extractAuthorizationToken(req.header('Authorization'));
       const session = this.accountSessions.byAccessKey.get(key);
-      if (!session || session.platform !== 'qq') return next();
+      if (!session || session.platform !== 'qqmusic') return next();
       try {
         await ensureQQLoginFresh(session, {
           registry: this.accountSessions,
@@ -167,14 +172,14 @@ class MultiPlatformServer {
         });
         next();
       } catch (error) {
-        this.logger.error('QQ 登录状态检查或刷新失败，继续使用当前凭证', error);
+        this.logger.error('QQ login refresh check failed, continue', error);
         next();
       }
     });
     this.app!.get('/v1/ytmusic/audio/:id', async (req: Request, res: Response, next: NextFunction) => {
       const verified = verifyStreamRequest(this.accountSessions.sessions, String(req.params.id), req.query);
       if (!verified) {
-        res.status(403).json(Result.error('音频链接无效或已过期', 403));
+        res.status(403).json(Result.error('Audio link invalid or expired', 403));
         return;
       }
       const controller = new AbortController();
@@ -196,72 +201,71 @@ class MultiPlatformServer {
           method: req.method === 'HEAD' ? 'HEAD' : 'GET', headers, signal: controller.signal
         });
         if (!upstream.ok || (req.method !== 'HEAD' && !upstream.body)) {
-          res.status(502).json(Result.error(`YouTube Music 音频请求失败 (${upstream.status})`, 502));
+          res.status(502).json(Result.error(`Youtube Music fetch failed (${upstream.status})`, 502));
           return;
         }
         const isMp4Audio = audio.format === 'm4a';
-        const upstreamRange = /^bytes 0-\d+\/(\d+)$/.exec(upstream.headers.get('content-range') || '');
-        const totalLength = upstreamRange ? Number(upstreamRange[1]) :
-          (upstream.status === 200 ? Number(upstream.headers.get('content-length')) : NaN);
+        const upstreamRangeHeader = upstream.headers.get('content-range');
+        const totalLength = upstreamRangeHeader ? Number(upstreamRangeHeader.split('/')[1]) :
+          (upstream.headers.get('content-length') ? Number(upstream.headers.get('content-length')) : NaN);
         if (rebaseRange && (!Number.isSafeInteger(totalLength) || totalLength <= 0 ||
-          (upstream.status !== 200 && !upstreamRange))) {
-          res.status(502).json(Result.error('YouTube Music 音频范围响应无效', 502));
+          (upstream.status !== 200 && upstream.status !== 206))) {
+          res.status(502).json(Result.error('Youtube range response invalid', 502));
           return;
         }
         if (rebaseRange && rebaseRange.start >= totalLength) {
           res.status(416).set('Content-Range', `bytes */${totalLength}`).end();
           return;
         }
-        const responseEnd = rebaseRange ? Math.min(rebaseRange.end ?? totalLength - 1, totalLength - 1) : 0;
+        const responseEnd = rebaseRange ? Math.min(rebaseRange.end ?? totalLength, totalLength) : 0;
         res.status(rebaseRange ? 206 : upstream.status);
         for (const key of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
           const value = upstream.headers.get(key);
           if (value) res.set(key, value);
         }
         if (rebaseRange) {
-          res.set('Content-Range', `bytes ${rebaseRange.start}-${responseEnd}/${totalLength}`);
-          res.set('Content-Length', String(responseEnd - rebaseRange.start + 1));
+          res.set('Content-Range', `bytes ${rebaseRange.start}-${responseEnd - 1}/${totalLength}`);
+          res.set('Content-Length', String(responseEnd - rebaseRange.start));
         }
         const lastModified = upstream.headers.get('last-modified');
         if (lastModified) {
           const parsed = Date.parse(lastModified);
-          // The normalized MP4 is a new representation; invalidate previously cached headers in Aduoer.
-          res.set('Last-Modified', isMp4Audio && Number.isFinite(parsed)
-            ? new Date(parsed + 1000).toUTCString() : lastModified);
+          if (Number.isFinite(parsed))
+            res.set('Last-Modified', isMp4Audio ? new Date(parsed + 1000).toUTCString() : new Date(parsed).toUTCString());
         }
-        const upstreamEtag = upstream.headers.get('etag');
-        if (upstreamEtag) res.set('ETag', isMp4Audio ? `W/"ytm-mdhd-v1-${upstreamEtag.replace(/[^a-zA-Z0-9]/g, '')}"` : upstreamEtag);
+        const etag = upstream.headers.get('etag');
+        if (etag) res.set('ETag', isMp4Audio ? `W/"ytm-mdhd-${etag.replace(/"/g, '')}"` : etag);
         res.set('Cache-Control', 'private, no-store');
         if (req.method === 'HEAD') {
           res.end();
           return;
         }
-        const handleStreamError = (error: Error) => {
+        const onStreamError = (error: Error) => {
           if (controller.signal.aborted && error.name === 'AbortError') return;
-          this.logger.error('YouTube Music audio stream failed', error);
-          if (!res.destroyed) res.destroy(error);
+          this.logger.error('Youtube stream error', error);
+          if (!res.headersSent) res.destroy();
         };
-        const source = Readable.fromWeb(upstream.body as any).on('error', handleStreamError);
+        const source = Readable.fromWeb(upstream.body as any).on('error', onStreamError);
         const startsAtZero = upstream.status === 200 ||
-          (upstream.status === 206 && /^bytes 0-\d+\//.test(upstream.headers.get('content-range') || ''));
+          (upstream.status === 206 && upstreamRangeHeader && /^bytes=0-/.test(range || ''));
         const output = startsAtZero && isMp4Audio
-          ? source.pipe(normalizeFragmentedMp4Stream().on('error', handleStreamError))
+          ? source.pipe(normalizeFragmentedMp4Stream()).on('error', onStreamError)
           : source;
-        if (rebaseRange) output.pipe(sliceByteRange(rebaseRange.start, responseEnd + 1).on('error', handleStreamError)).pipe(res);
+        if (rebaseRange) output.pipe(sliceByteRange(rebaseRange.start, responseEnd).on('error', onStreamError)).pipe(res);
         else output.pipe(res);
       } catch (error) {
-        if (controller.signal.aborted || res.destroyed) return;
+        if (controller.signal.aborted || res.writableEnded) return;
         if (!res.headersSent) next(error);
         else res.destroy(error as Error);
       }
     });
     this.app!.use(createWowRouter({
-      resolveContext: createWowContextResolver(this.accountSessions, this.lxSourceManager),
-      onError: (error, request) => this.logger.error('Wow v1 request failed', error, { url: request.url })
+      contextResolver: createWowContextResolver(this.accountSessions, this.lxSourceManager),
+      onError: (error, request) => this.logger.error('Wow v1 error', error, { url: request.url })
     }));
     if (this.preload) {
       void preloadData(platformFactory, this.accountSessions, this.lxSourceManager).catch((error) => {
-        this.logger.error('Background favorites preload failed', error);
+        this.logger.error('Background preload failed', error);
       });
     }
 
@@ -276,11 +280,11 @@ class MultiPlatformServer {
     });
 
     this.app!.use((_req: Request, res: Response) => {
-      res.status(404).json(Result.error('API endpoint not found', 404));
+      res.status(404).json(Result.error('Not found', 404));
     });
 
     this.app!.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
-      this.logger.error('Unhandled error', error, { url: _req.url });
+      this.logger.error('Unhandled server error', error, { url: _req.url });
       if (error instanceof APIError) {
         res.status(error.status).json(Result.error(error.message, error.status));
         return;
@@ -291,7 +295,7 @@ class MultiPlatformServer {
 
   private reconcileLxSources(): void {
     this.lxSourceManager.reconcileAccountSources(
-      this.accountSessions.sessions.map((session) => session.lxSource)
+      this.accountSessions.sessions.map(session => session.lxSource)
     );
   }
 
@@ -314,33 +318,33 @@ class MultiPlatformServer {
       const platformName = (req.query.platform as string) || req.body?.platform || 'netease';
 
       if (platformName === 'qqmusic' && ['song/url', 'song/url/v1'].includes(route)) {
-        res.status(422).json(Result.error('QQ 播放请使用 /v1/track/url 的洛雪源链路', 422));
+        res.status(422).json(Result.error('QQ music please use /v1/track/url lx source route', 422));
         return;
       }
 
       const platform = platformFactory.getPlatform(platformName);
-      const result = await platform.callModule(route, req);
+      const result = await platform.callRoute(route, req);
 
       res.status(result.code).json(result);
 
     } catch (error) {
-      const responseTime = Date.now() - startTime;
+      const responseTimeMs = Date.now() - startTime;
 
-      this.logger.error('API request failed', error, {
+      this.logger.error('Resource api error', error, {
         route,
         platform: (req.query.platform as string) || req.body?.platform || 'unknown',
-        responseTime
+        responseTimeMs
       });
 
-      const errorResult = Result.error(error, 500);
-      res.status(errorResult.code).json(errorResult);
+      const errorResult = Result.error(String((error as Error).message), 500);
+      res.status(500).json(errorResult);
     }
   }
 
   stop(): void {
     if (this.app && this.app.server) {
       this.app.server.close();
-      this.logger.info('Server stopped');
+      this.logger.info('Server closed');
     }
   }
 }
@@ -356,17 +360,17 @@ export interface CreateAppOptions {
 }
 
 export interface AppLxSourceManager extends LxTrackUrlResolver, LxSourceLifecycle {
-  reconcileAccountSources(sourceGroups: readonly (readonly string[])[]): void;
+  reconcileAccountSources(sourceGroups: readonly (string | undefined)[]): void;
 }
 
-function loadLocalAccountStore(): AccountStore {
+function loadLocalAccountStore(): SqliteAccountStore {
   const localRequire = require;
-  return localRequire('./storage').createLocalAccountStore();
+  return localRequire('./storage/accounts').createLocalAccountStore();
 }
 
 function loadLocalLxSourceManager(): AppLxSourceManager {
   const localRequire = require;
-  return localRequire('./lx-resource').createLxSourceManager();
+  return localRequire('./lx-resource').createLocalLxSourceManager();
 }
 
 export async function createApp(options: CreateAppOptions = {}): Promise<Express> {
