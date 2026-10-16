@@ -1,8 +1,11 @@
-// Upstash Redis REST API helper (Type-safe)
+// Upstash Redis REST API helper (With Debug Logs)
 function syncToRedis(command: string[]) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return;
+  if (!url || !token) {
+    console.log('[Upstash Redis] Error: Missing URL or TOKEN environment variables.');
+    return;
+  }
 
   // @ts-ignore
   fetch(url, {
@@ -12,9 +15,14 @@ function syncToRedis(command: string[]) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(command),
-  }).catch((err: any) => {
-    console.error('Upstash Redis Sync Error:', err);
-  });
+  })
+    .then(async (res: any) => {
+      const text = await res.text();
+      console.log('[Upstash Redis] Sync response status:', res.status, text);
+    })
+    .catch((err: any) => {
+      console.error('[Upstash Redis] Sync Network Error:', err);
+    });
 }
 
 import fs from 'node:fs';
@@ -168,10 +176,11 @@ export class SqliteAccountStore implements AccountStore {
       },
       body: JSON.stringify(['GET', 'wow_origin_accounts_backup']),
     })
-      .then((res: any) => res.json())
-      .then((data: any) => {
-        if (!data || !data.result) return;
-        const accounts = JSON.parse(data.result);
+      .then(async (res: any) => {
+        const json = await res.json();
+        console.log('[Upstash Redis] Restore result:', json);
+        if (!json || !json.result) return;
+        const accounts = JSON.parse(json.result);
         if (!Array.isArray(accounts) || accounts.length === 0) return;
 
         const countRow = this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number };
@@ -184,17 +193,19 @@ export class SqliteAccountStore implements AccountStore {
               }
             }
             this.database.exec('COMMIT');
-            console.log(`[accounts] Restored ${accounts.length} accounts from Upstash Redis.`);
+            console.log(`[accounts] Successfully restored ${accounts.length} accounts from Upstash Redis.`);
           } catch (e) {
             this.database.exec('ROLLBACK');
+            console.error('[accounts] Restore transaction error:', e);
           }
         }
       })
-      .catch((e: any) => console.error('[accounts] Redis restore error:', e));
+      .catch((e: any) => console.error('[Upstash Redis] Restore Network Error:', e));
   }
 
   private persistToRedis(): void {
     const accounts = this.list();
+    console.log('[accounts] Syncing accounts to Upstash Redis, count:', accounts.length);
     syncToRedis(['SET', 'wow_origin_accounts_backup', JSON.stringify(accounts)]);
   }
 
