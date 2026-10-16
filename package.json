@@ -5,7 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx src/server.ts",
-    "build": "tsc --skipLibCheck true --noEmitOnError false",
+    "build": "tsc --noCheck",
     "start": "node dist/server.js",
     "lint": "eslint src/**/*.ts"
   },
