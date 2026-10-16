@@ -20,7 +20,7 @@ RUN addgroup -g 1001 -S nodejs && \
     chown -R nodejs:nodejs /app/data
 
 COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm install --omit=dev && npm cache clean --force
 
 COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
 COPY --chown=nodejs:nodejs core ./core
