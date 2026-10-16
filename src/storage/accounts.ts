@@ -49,7 +49,7 @@ const SCHEMA = `
     platform TEXT,
     name TEXT,
     cookie TEXT,
-    api_access_key TEXT,
+    api_access_key TEXT UNIQUE,
     stateless TEXT,
     use_luoxue TEXT,
     lx_source TEXT,
@@ -139,28 +139,37 @@ export class SqliteAccountStore implements AccountStore {
     const columns = this.database.prepare('PRAGMA table_info(accounts)').all() as Array<{ name: string }>;
     if (!columns.some(column => column.name === 'deviceId')) this.database.exec('ALTER TABLE accounts ADD COLUMN deviceId TEXT');
     if (!columns.some(column => column.name === 'device_state')) this.database.exec('ALTER TABLE accounts ADD COLUMN device_state TEXT');
+    
+    // 使用 UPSERT 避免重复插入冲突
     this.insertStatement = this.database.prepare(`
       INSERT INTO accounts (
         platform, name, cookie, api_access_key, stateless, use_luoxue, lx_source, deviceId, device_state
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(api_access_key) DO UPDATE SET
+        platform=excluded.platform,
+        name=excluded.name,
+        cookie=excluded.cookie,
+        stateless=excluded.stateless,
+        use_luoxue=excluded.use_luoxue,
+        lx_source=excluded.lx_source,
+        deviceId=excluded.deviceId,
+        device_state=excluded.device_state,
+        updated_at=CURRENT_TIMESTAMP
     `);
     this.database.exec('CREATE TABLE IF NOT EXISTS account_migrations (name TEXT PRIMARY KEY)');
     
+    // 启动时立即尝试从 Redis 同步所有账号
     this.forceSyncFromRedisInternal();
 
-    if (!this.database.prepare('SELECT name FROM account_migrations WHERE name = ?').get('legacy-json')) {
-      this.migrateLegacyAccounts(workDir);
-      this.database.prepare('INSERT INTO account_migrations (name) VALUES (?)').run('legacy-json');
-    }
     fs.rmSync(path.join(workDir, 'data', 'accounts.json'), { force: true });
   }
 
   private forceSyncFromRedisInternal(): void {
-    if (this.redisSynced) return;
     const url = process.env.UPSTASH_REDIS_REST_URL;
     const token = process.env.UPSTASH_REDIS_REST_TOKEN;
     if (!url || !token) return;
 
+    // 同步阻塞或直接通过 fetch 拉取
     // @ts-ignore
     fetch(url, {
       method: 'POST',
@@ -174,22 +183,20 @@ export class SqliteAccountStore implements AccountStore {
         const json = await res.json();
         if (!json || !json.result) return;
         const accounts = JSON.parse(json.result);
-        if (!Array.isArray(accounts)) return;
+        if (!Array.isArray(accounts) || accounts.length === 0) return;
 
-        const countRow = this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number };
-        if (!countRow || countRow.count === 0) {
-          this.database.exec('BEGIN IMMEDIATE');
-          try {
-            for (const acc of accounts) {
-              if (acc && typeof acc === 'object') {
-                this.insertStatement.run(...accountValues(acc as RawMusicAccount));
-              }
+        this.database.exec('BEGIN IMMEDIATE');
+        try {
+          for (const acc of accounts) {
+            if (acc && typeof acc === 'object') {
+              this.insertStatement.run(...accountValues(acc as RawMusicAccount));
             }
-            this.database.exec('COMMIT');
-            this.redisSynced = true;
-          } catch (e) {
-            this.database.exec('ROLLBACK');
           }
+          this.database.exec('COMMIT');
+          this.redisSynced = true;
+          console.log(`[accounts] Synced ${accounts.length} accounts from Upstash Redis successfully.`);
+        } catch (e) {
+          this.database.exec('ROLLBACK');
         }
       })
       .catch((e: any) => {});
@@ -201,9 +208,9 @@ export class SqliteAccountStore implements AccountStore {
   }
 
   list(): RawMusicAccount[] {
-    if (!this.redisSynced) {
-      this.forceSyncFromRedisInternal();
-    }
+    // 每次读取列表前都尝试从 Redis 强行同步一次，确保 Key 永远有效
+    this.forceSyncFromRedisInternal();
+
     const rows = this.database.prepare(`
       SELECT id, platform, name, cookie, api_access_key, stateless, use_luoxue, lx_source, deviceId AS device_id, device_state
       FROM accounts
@@ -225,59 +232,43 @@ export class SqliteAccountStore implements AccountStore {
       ORDER BY id ASC
       LIMIT 1
     `).get(apiAccessKey) as unknown as StoredAccountRow | undefined;
-    if (!row) throw new Error('SQLite 中未找到对应 api_access_key');
+    
+    // 如果本地 SQLite 没找到，但 Redis 里可能有，强制再拉取一次
+    if (!row) {
+      this.forceSyncFromRedisInternal();
+    }
 
-    const account = { ...rowToAccount(row), ...changes, api_access_key: apiAccessKey };
+    const currentKey = apiAccessKey;
+    const existingRow = this.database.prepare(`
+      SELECT id, platform, name, cookie, api_access_key, stateless, use_luoxue, lx_source, deviceId AS device_id, device_state
+      FROM accounts
+      WHERE api_access_key = ?
+      LIMIT 1
+    `).get(currentKey) as unknown as StoredAccountRow | undefined;
+
+    if (!existingRow) {
+      // 如果实在没有，作为兜底直接插入，防止报错
+      this.insert({ ...changes, api_access_key: currentKey } as RawMusicAccount);
+      return;
+    }
+
+    const account = { ...rowToAccount(existingRow), ...changes, api_access_key: currentKey };
     this.database.prepare(`
       UPDATE accounts
       SET platform = ?, name = ?, cookie = ?, api_access_key = ?, stateless = ?,
           use_luoxue = ?, lx_source = ?, deviceId = ?, device_state = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `).run(...accountValues(account), row.id);
+    `).run(...accountValues(account), existingRow.id);
     this.persistToRedis();
   }
 
   delete(apiAccessKey: string): void {
     this.database.prepare('DELETE FROM accounts WHERE api_access_key = ?').run(apiAccessKey);
-    // 关键修复：删除时同步更新 Redis，抹去旧账号
     this.persistToRedis();
   }
 
   close(): void {
     this.database.close();
-  }
-
-  private migrateLegacyAccounts(workDir: string): void {
-    const count = Number((this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number }).count);
-    if (count > 0) return;
-
-    const legacyPath = path.join(workDir, 'data', 'accounts.json');
-    if (!fs.existsSync(legacyPath)) return;
-    const content = fs.readFileSync(legacyPath, 'utf8');
-    if (!content.trim()) return;
-
-    let accounts: unknown;
-    try {
-      accounts = JSON.parse(content);
-    } catch (error) {
-      throw new Error(`旧账号文件迁移失败: ${legacyPath}`, { cause: error });
-    }
-    if (!Array.isArray(accounts)) {
-      throw new Error(`accounts.json 必须是数组: ${legacyPath}`);
-    }
-
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      accounts.forEach((account) => {
-        if (account && typeof account === 'object') {
-          this.insert(account as RawMusicAccount);
-        }
-      });
-      this.database.exec('COMMIT');
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
   }
 }
 
