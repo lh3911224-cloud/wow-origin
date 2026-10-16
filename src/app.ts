@@ -8,7 +8,6 @@ import { preloadData } from './onload';
 import { APIError } from './errors';
 import { AccountSessionRegistry, extractAuthorizationToken, loadAccountSessions } from './accounts';
 import type { AccountStore } from './storage';
-import type { SqliteAccountStore } from './storage/accounts';
 import { createLoginRouter } from './login';
 import { createDashboardRouter } from './dashboard';
 import { createLoginRefreshScheduler, ensureQQLoginFresh, clearAccountLoginRefresh } from './loginRefresh';
@@ -62,7 +61,7 @@ class MultiPlatformServer {
     }
     if (!this.accountStore) {
       this.accountStore = loadLocalAccountStore();
-      await (this.accountStore as SqliteAccountStore).init();
+      // Redis版本不需要init
     }
     await this.registerPlatforms();
 
@@ -210,7 +209,7 @@ class MultiPlatformServer {
           (upstream.headers.get('content-length') ? Number(upstream.headers.get('content-length')) : NaN);
         if (rebaseRange && (!Number.isSafeInteger(totalLength) || totalLength <= 0 ||
           (upstream.status !== 200 && upstream.status !== 206))) {
-          res.status(502).json(Result.error('Youtube range response invalid', 502));
+          res.status(502).json(Result.error('Youtube range response invalid', error));
           return;
         }
         if (rebaseRange && rebaseRange.start >= totalLength) {
@@ -274,7 +273,7 @@ class MultiPlatformServer {
       .filter((route: string) => !INTERNAL_RESOURCE_ROUTES.has(route));
 
     resourceRoutes.forEach((route: string) => {
-      this.app!.all(`/${route}`, async (req: Request, res: Response) => {
+      this.app!.all(`/${route}`, async (req: Request, res: Response, route) => {
         await this.handleResourceAPI(req, res, route);
       });
     });
@@ -344,7 +343,6 @@ class MultiPlatformServer {
   stop(): void {
     if (this.app && this.app.server) {
       this.app.server.close();
-      this.logger.info('Server closed');
     }
   }
 }
@@ -363,7 +361,7 @@ export interface AppLxSourceManager extends LxTrackUrlResolver, LxSourceLifecycl
   reconcileAccountSources(sourceGroups: readonly (string | undefined)[]): void;
 }
 
-function loadLocalAccountStore(): SqliteAccountStore {
+function loadLocalAccountStore(): any {
   const localRequire = require;
   return localRequire('./storage/accounts').createLocalAccountStore();
 }
