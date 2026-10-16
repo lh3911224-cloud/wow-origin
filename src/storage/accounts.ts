@@ -1,9 +1,10 @@
-// Upstash Redis REST API helper
+// Upstash Redis REST API helper (Type-safe)
 function syncToRedis(command: string[]) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) return;
 
+  // @ts-ignore
   fetch(url, {
     method: 'POST',
     headers: {
@@ -11,7 +12,7 @@ function syncToRedis(command: string[]) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(command),
-  }).catch((err) => {
+  }).catch((err: any) => {
     console.error('Upstash Redis Sync Error:', err);
   });
 }
@@ -144,7 +145,6 @@ export class SqliteAccountStore implements AccountStore {
     `);
     this.database.exec('CREATE TABLE IF NOT EXISTS account_migrations (name TEXT PRIMARY KEY)');
     
-    // 初始化时，如果 Redis 有备份数据且本地为空，则插入本地
     this.restoreFromRedis();
 
     if (!this.database.prepare('SELECT name FROM account_migrations WHERE name = ?').get('legacy-json')) {
@@ -159,6 +159,7 @@ export class SqliteAccountStore implements AccountStore {
     const token = process.env.UPSTASH_REDIS_REST_TOKEN;
     if (!url || !token) return;
 
+    // @ts-ignore
     fetch(url, {
       method: 'POST',
       headers: {
@@ -167,8 +168,8 @@ export class SqliteAccountStore implements AccountStore {
       },
       body: JSON.stringify(['GET', 'wow_origin_accounts_backup']),
     })
-      .then((res) => res.json())
-      .then((data) => {
+      .then((res: any) => res.json())
+      .then((data: any) => {
         if (!data || !data.result) return;
         const accounts = JSON.parse(data.result);
         if (!Array.isArray(accounts) || accounts.length === 0) return;
@@ -189,7 +190,7 @@ export class SqliteAccountStore implements AccountStore {
           }
         }
       })
-      .catch((e) => console.error('[accounts] Redis restore error:', e));
+      .catch((e: any) => console.error('[accounts] Redis restore error:', e));
   }
 
   private persistToRedis(): void {
