@@ -1,3 +1,26 @@
+// Upstash Redis REST API helper
+async function upstashRedisCmd(command: string[]) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(command),
+    });
+    const data = await res.json();
+    return data.result;
+  } catch (err) {
+    console.error('Upstash Redis Sync Error:', err);
+    return null;
+  }
+}
+
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
@@ -125,11 +148,60 @@ export class SqliteAccountStore implements AccountStore {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.database.exec('CREATE TABLE IF NOT EXISTS account_migrations (name TEXT PRIMARY KEY)');
+    
+    // 同步云端 Redis 数据到本地 SQLite
+    this.syncFromRedis();
+
     if (!this.database.prepare('SELECT name FROM account_migrations WHERE name = ?').get('legacy-json')) {
       this.migrateLegacyAccounts(workDir);
       this.database.prepare('INSERT INTO account_migrations (name) VALUES (?)').run('legacy-json');
     }
     fs.rmSync(path.join(workDir, 'data', 'accounts.json'), { force: true });
+  }
+
+  // 从 Upstash Redis 恢复数据到本地
+  private syncFromRedis(): void {
+    try {
+      // 异步转同步获取（在构造函数中通过 IIFE 执行）
+      upstashRedisCmd(['GET', 'wow_origin_accounts_backup']).then((remoteData) => {
+        if (!remoteData) return;
+        const accounts = JSON.parse(remoteData);
+        if (!Array.isArray(accounts) || accounts.length === 0) return;
+
+        const count = Number((this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number }).count);
+        if (count === 0) {
+          this.database.exec('BEGIN IMMEDIATE');
+          try {
+            accounts.forEach((acc) => {
+              if (acc && typeof acc === 'object') {
+                this.insertStatement.run(...accountValues(acc as RawMusicAccount));
+              }
+            });
+            this.database.exec('COMMIT');
+            console.log(`[accounts] Successfully restored ${accounts.length} accounts from Upstash Redis.`);
+          } catch (e) {
+            this.database.exec('ROLLBACK');
+            console.error('[accounts] Failed to restore from Redis:', e);
+          }
+        }
+      }).catch(err => {
+        console.error('[accounts] Redis fetch failed during init:', err);
+      });
+    } catch (e) {
+      console.error('[accounts] syncFromRedis error:', e);
+    }
+  }
+
+  // 每次修改后同步备份到 Upstash Redis
+  private persistToRedis(): void {
+    try {
+      const accounts = this.list();
+      upstashRedisCmd(['SET', 'wow_origin_accounts_backup', JSON.stringify(accounts)]).catch(err => {
+        console.error('[accounts] Failed to backup to Redis:', err);
+      });
+    } catch (e) {
+      console.error('[accounts] persistToRedis error:', e);
+    }
   }
 
   list(): RawMusicAccount[] {
@@ -143,6 +215,7 @@ export class SqliteAccountStore implements AccountStore {
 
   insert(account: RawMusicAccount): void {
     this.insertStatement.run(...accountValues(account));
+    this.persistToRedis();
   }
 
   update(apiAccessKey: string, changes: Partial<RawMusicAccount>): void {
@@ -162,10 +235,12 @@ export class SqliteAccountStore implements AccountStore {
           use_luoxue = ?, lx_source = ?, deviceId = ?, device_state = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(...accountValues(account), row.id);
+    this.persistToRedis();
   }
 
   delete(apiAccessKey: string): void {
     this.database.prepare('DELETE FROM accounts WHERE api_access_key = ?').run(apiAccessKey);
+    this.persistToRedis();
   }
 
   close(): void {
