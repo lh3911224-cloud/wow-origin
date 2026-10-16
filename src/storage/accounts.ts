@@ -8,11 +8,11 @@ const DB_FILE = path.join(process.cwd(), 'data', 'accounts.db');
 const DB_DIR = path.dirname(DB_FILE);
 const REDIS_KEY = 'wow_origin_account_backup';
 
-function getRedisConfig() {
-  return {
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN
-  };
+function getRedisClient() {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  return new Redis({ url, token });
 }
 
 export interface AccountStore {
@@ -45,11 +45,10 @@ export class SqliteAccountStore implements AccountStore {
     this.selectAllStmt = this.db.prepare(`SELECT data FROM accounts`);
   }
 
-  // 新增：启动时从Redis恢复账号
+  // 启动时从Redis恢复账号
   async init(): Promise<void> {
-    const redisCfg = getRedisConfig();
-    if (!redisCfg.url || !redisCfg.token) return;
-    const redis = new Redis(redisCfg);
+    const redis = getRedisClient();
+    if (!redis) return;
     try {
       const raw = await redis.get<string>(REDIS_KEY);
       if (!raw) return;
@@ -58,9 +57,9 @@ export class SqliteAccountStore implements AccountStore {
       for (const item of list) {
         this.insertStmt.run(item.apiAccessKey, JSON.stringify(item));
       }
-      console.log(`[SqliteStore] Restored ${list.length} accounts from Redis, overwrite local db.`);
+      console.log(`[SqliteStore] Redis恢复账号数量：${list.length}`);
     } catch (err) {
-      console.log('[SqliteStore] Redis restore failed', err);
+      console.log('[SqliteStore] Redis读取账号失败，继续使用本地数据库', err);
     }
   }
 
@@ -88,16 +87,16 @@ export class SqliteAccountStore implements AccountStore {
     return rows.map(r => JSON.parse(r.data));
   }
 
-  // 账号变动自动备份到Redis
+  // 账号有变动自动备份到Redis
   private async backupToRedis() {
-    const redisCfg = getRedisConfig();
-    if (!redisCfg.url || !redisCfg.token) return;
-    const redis = new Redis(redisCfg);
+    const redis = getRedisClient();
+    if (!redis) return;
     try {
       const all = this.list();
       await redis.set(REDIS_KEY, JSON.stringify(all));
+      console.log(`[SqliteStore] 账号已自动备份到Redis，共${all.length}条`);
     } catch (e) {
-      console.log('[SqliteStore] Redis backup error', e);
+      console.log('[SqliteStore] Redis备份账号失败', e);
     }
   }
 }
