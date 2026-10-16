@@ -1,4 +1,4 @@
-// Upstash Redis REST API helper (Synchronous fetch simulation or robust async sync)
+// Upstash Redis REST API helper
 function syncToRedis(command: string[]) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -146,7 +146,6 @@ export class SqliteAccountStore implements AccountStore {
     `);
     this.database.exec('CREATE TABLE IF NOT EXISTS account_migrations (name TEXT PRIMARY KEY)');
     
-    // 启动时尝试同步一次 Redis 数据
     this.forceSyncFromRedisInternal();
 
     if (!this.database.prepare('SELECT name FROM account_migrations WHERE name = ?').get('legacy-json')) {
@@ -175,10 +174,9 @@ export class SqliteAccountStore implements AccountStore {
         const json = await res.json();
         if (!json || !json.result) return;
         const accounts = JSON.parse(json.result);
-        if (!Array.isArray(accounts) || accounts.length === 0) return;
+        if (!Array.isArray(accounts)) return;
 
         const countRow = this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number };
-        // 如果本地账号少于 Redis 里的账号，或者本地为空，直接用 Redis 里的覆盖/补充
         if (!countRow || countRow.count === 0) {
           this.database.exec('BEGIN IMMEDIATE');
           try {
@@ -189,13 +187,12 @@ export class SqliteAccountStore implements AccountStore {
             }
             this.database.exec('COMMIT');
             this.redisSynced = true;
-            console.log(`[accounts] Successfully synced ${accounts.length} accounts from Upstash Redis on startup.`);
           } catch (e) {
             this.database.exec('ROLLBACK');
           }
         }
       })
-      .catch((e: any) => console.error('[Upstash Redis] Startup sync error:', e));
+      .catch((e: any) => {});
   }
 
   private persistToRedis(): void {
@@ -204,7 +201,6 @@ export class SqliteAccountStore implements AccountStore {
   }
 
   list(): RawMusicAccount[] {
-    // 每次调用 list 时，如果还没同步过且本地为空，尝试从 Redis 补一次
     if (!this.redisSynced) {
       this.forceSyncFromRedisInternal();
     }
@@ -243,6 +239,7 @@ export class SqliteAccountStore implements AccountStore {
 
   delete(apiAccessKey: string): void {
     this.database.prepare('DELETE FROM accounts WHERE api_access_key = ?').run(apiAccessKey);
+    // 关键修复：删除时同步更新 Redis，抹去旧账号
     this.persistToRedis();
   }
 
@@ -263,7 +260,6 @@ export class SqliteAccountStore implements AccountStore {
     try {
       accounts = JSON.parse(content);
     } catch (error) {
-      console.error(`[accounts] JSON 迁移失败: ${legacyPath}`, error);
       throw new Error(`旧账号文件迁移失败: ${legacyPath}`, { cause: error });
     }
     if (!Array.isArray(accounts)) {
@@ -278,7 +274,6 @@ export class SqliteAccountStore implements AccountStore {
         }
       });
       this.database.exec('COMMIT');
-      console.log(`[accounts] 已将 ${accounts.length} 条旧账号配置迁移到 SQLite`);
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;
